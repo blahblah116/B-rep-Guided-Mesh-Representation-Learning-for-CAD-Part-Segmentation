@@ -115,6 +115,3 @@ def save_prediction_meshes(
     error_colors[:] = np.array([30, 170, 80], dtype=np.uint8)
     error_colors[pred_np != gt_np] = np.array([220, 40, 40], dtype=np.uint8)
     write_face_colored_ply(out_dir / f"{sample_name}_error.ply", verts_np, faces_np, error_colors)
-
-    np.save(out_dir / f"{sample_name}_pred.npy", pred_np)
-    np.save(out_dir / f"{sample_name}_gt.npy", gt_np)

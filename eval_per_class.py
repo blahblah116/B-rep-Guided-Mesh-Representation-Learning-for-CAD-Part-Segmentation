@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .data import Fusion360BRepMeshDataset, collate_distill_samples
+from .data import BRepMeshDataset, collate_distill_samples
 from .models import (
     DiffusionMeshStudent,
     FOVNetFaceTeacher,
@@ -96,7 +96,7 @@ def main():
     num_classes = args.num_classes
     class_names = CLASS_NAMES.get(args.dataset, [str(i) for i in range(num_classes)])
 
-    test_set = Fusion360BRepMeshDataset(
+    test_set = BRepMeshDataset(
         split="test",
         data_root=args.data_root,
         brep_graph_root=args.brep_graph_root,

@@ -52,7 +52,7 @@ def _to_float32_graph(graph: dgl.DGLGraph) -> dgl.DGLGraph:
     return graph
 
 
-class Fusion360BRepMeshDataset(Dataset):
+class BRepMeshDataset(Dataset):
     """Paired sample: FOVNet B-rep graph plus OBJ mesh and face correspondence."""
 
     def __init__(

@@ -30,6 +30,7 @@ def rkd_distance_loss(
     teacher_dist = torch.pdist(teacher.detach(), p=2)
     student_dist = torch.pdist(student, p=2)
 
+    # From Original RKD(0518)
     teacher_dist = teacher_dist / teacher_dist.mean().clamp_min(eps)
     student_dist = student_dist / student_dist.mean().clamp_min(eps)
     return F.smooth_l1_loss(student_dist, teacher_dist)

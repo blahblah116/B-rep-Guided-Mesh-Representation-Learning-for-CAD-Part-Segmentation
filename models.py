@@ -32,38 +32,43 @@ class FOVNetFaceTeacher(nn.Module):
     def forward(self, graph):
         m = self.model
 
-        if m.use_uv:
-            for key in ("x", "x_local"):
-                if key in graph.ndata and graph.ndata[key].dim() == 4 and graph.ndata[key].shape[-1] == 7:
-                    graph.ndata[key] = graph.ndata[key].permute(0, 3, 1, 2).contiguous()
-        if m.vision and "vision_grids" in graph.ndata:
-            vg = graph.ndata["vision_grids"]
-            if vg.dim() == 4 and vg.shape[-1] == 6:
-                graph.ndata["vision_grids"] = vg.permute(0, 3, 1, 2).contiguous()
+        # Use local_scope so ndata/edata mutations do not persist on the original graph.
+        # Without this, popping unused keys would destroy the sample's brep_graph in-place,
+        # breaking any second access to the same sample (e.g., gradient accumulation).
+        with graph.local_scope():
+            if m.use_uv:
+                for key in ("x", "x_local"):
+                    if key in graph.ndata and graph.ndata[key].dim() == 4 and graph.ndata[key].shape[-1] == 7:
+                        graph.ndata[key] = graph.ndata[key].permute(0, 3, 1, 2).contiguous()
+            if m.vision and "vision_grids" in graph.ndata:
+                vg = graph.ndata["vision_grids"]
+                if vg.dim() == 4 and vg.shape[-1] == 6:
+                    graph.ndata["vision_grids"] = vg.permute(0, 3, 1, 2).contiguous()
 
-        keep = {m.uv_key, "vision_grids"} | ({"face_feat"} if m.use_face_feat else set())
-        for key in list(graph.ndata.keys()):
-            if key not in keep:
-                graph.ndata.pop(key)
-        for key in list(graph.edata.keys()):
-            graph.edata.pop(key)
+            keep = {m.uv_key, "vision_grids"} | ({"face_feat"} if m.use_face_feat else set())
+            for key in list(graph.ndata.keys()):
+                if key not in keep:
+                    graph.ndata.pop(key)
+            for key in list(graph.edata.keys()):
+                graph.edata.pop(key)
 
-        parts = []
-        if m.use_uv and m.uv_key in graph.ndata:
-            parts.append(m.surf_encoder(graph.ndata[m.uv_key]))
-        vg = graph.ndata.get("vision_grids")
-        if m.vision and vg is not None:
-            if m.ov_encoder:
-                parts.append(m.ov_encoder(vg[:, m.ov_channels]))
-            if m.iv_encoder:
-                parts.append(m.iv_encoder(vg[:, m.iv_channels]))
-        if m.use_face_feat and "face_feat" in graph.ndata:
-            parts.append(graph.ndata["face_feat"][:, :7])
+            parts = []
+            if m.use_uv and m.uv_key in graph.ndata:
+                parts.append(m.surf_encoder(graph.ndata[m.uv_key]))
+            vg = graph.ndata.get("vision_grids")
+            if m.vision and vg is not None:
+                if m.ov_encoder:
+                    parts.append(m.ov_encoder(vg[:, m.ov_channels]))
+                if m.iv_encoder:
+                    parts.append(m.iv_encoder(vg[:, m.iv_channels]))
+            if m.use_face_feat and "face_feat" in graph.ndata:
+                parts.append(graph.ndata["face_feat"][:, :7])
 
-        hidden = m.shared_fc(torch.cat(parts, dim=1))
-        node_emb, graph_emb = m.graph_encoder(graph, hidden)
-        expanded = graph_emb.repeat_interleave(graph.batch_num_nodes().to(graph_emb.device), dim=0)
-        logits = m.seg(torch.cat((node_emb, expanded), dim=1))
+            hidden = m.shared_fc(torch.cat(parts, dim=1))
+            node_emb, graph_emb = m.graph_encoder(graph, hidden)
+            expanded = graph_emb.repeat_interleave(graph.batch_num_nodes().to(graph_emb.device), dim=0)
+            logits = m.seg(torch.cat((node_emb, expanded), dim=1))
+
         return logits, node_emb
 
 
