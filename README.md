@@ -18,7 +18,7 @@ conda activate distillation
 
 ### Fusion360 (recommended)
 
-Download the [Fusion 360 Gallery Segmentation dataset](https://github.com/AutodeskAILab/Fusion-360-Gallery-Dataset) and place it as:
+Download the [Fusion 360 Gallery Segmentation dataset](https://github.com/AutodeskAILab/Fusion360GalleryDataset/blob/master/docs/segmentation.md) and place it as:
 
 ```
 data/fusion360/s2.0.1/
@@ -49,7 +49,7 @@ python -m B2Mesh.train \
     --student_type diffusion_net \
     --dataset fusion360 \
     --data_root /path/to/fusion360/s2.0.1 \
-    --input_features hks \
+    --input_features xyz \
     --op_cache_dir /path/to/op_cache \
     --epochs 50 \
     --lr 1e-3
@@ -63,7 +63,7 @@ python -m B2Mesh.train \
     --dataset fusion360 \
     --data_root /path/to/fusion360/s2.0.1 \
     --teacher_ckpt /path/to/fovnet_best.ckpt \
-    --input_features hks \
+    --input_features xyz \
     --op_cache_dir /path/to/op_cache \
     --epochs 50 \
     --distill_weight 1.0
