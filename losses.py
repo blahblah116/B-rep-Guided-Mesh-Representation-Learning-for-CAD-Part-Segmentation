@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -86,19 +87,49 @@ def relational_distillation_loss(
     raise ValueError(f"Unknown RKD mode: {mode}")
 
 
-def feature_alignment_loss(
-    teacher: torch.Tensor,
-    student: torch.Tensor,
-    mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Optional direct normalized feature alignment."""
+class FCRDLoss(nn.Module):
+    """Face-level cross-modal contrastive distillation loss.
 
-    if mask is not None:
-        teacher = teacher[mask]
-        student = student[mask]
-    if teacher.numel() == 0:
-        return teacher.new_zeros(())
-    return F.mse_loss(F.normalize(student, dim=-1), F.normalize(teacher.detach(), dim=-1))
+    Pulls together teacher and student embeddings that share the same B-rep
+    face label (SupCon-style multi-positive), while pushing apart pairs with
+    different labels. Objects where all faces share one label are skipped
+    (no meaningful negatives exist).
+    """
+
+    def __init__(self, embedding_dim: int, proj_dim: int = 128, tau: float = 0.07) -> None:
+        super().__init__()
+        self.proj_t = nn.Linear(embedding_dim, proj_dim, bias=False)
+        self.proj_s = nn.Linear(embedding_dim, proj_dim, bias=False)
+        self.tau = tau
+
+    def forward(
+        self,
+        teacher_emb: torch.Tensor,  # (F, embedding_dim)
+        student_emb: torch.Tensor,  # (F, embedding_dim)
+        labels: torch.Tensor,       # (F,)  B-rep face labels
+        mask: torch.Tensor,         # (F,)  bool — faces with mesh coverage
+    ) -> torch.Tensor:
+        teacher_emb = teacher_emb[mask]
+        student_emb = student_emb[mask]
+        labels      = labels[mask]
+
+        # Need at least two distinct labels to have any negatives.
+        if labels.unique().shape[0] < 2:
+            return teacher_emb.new_zeros(())
+
+        z_t = F.normalize(self.proj_t(teacher_emb), dim=-1)   # (F', proj_dim)
+        z_s = F.normalize(self.proj_s(student_emb), dim=-1)   # (F', proj_dim)
+
+        # sim[i, j] = cosine similarity between teacher face i and student face j
+        sim      = z_t @ z_s.T / self.tau                          # (F', F')
+        pos_mask = (labels[:, None] == labels[None, :]).float()     # (F', F')
+
+        # log P(j | i) = sim[i,j] - log Σ_k exp(sim[i,k])
+        log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)  # (F', F')
+
+        # Average log-prob over all positives for each anchor.
+        loss = -(log_prob * pos_mask).sum(1) / pos_mask.sum(1)
+        return loss.mean()
 
 
 def scatter_mean_by_index(

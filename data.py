@@ -70,6 +70,7 @@ class BRepMeshDataset(Dataset):
         limit: int | None = None,
         validate_files: bool = True,
         load_mesh: bool = True,
+        load_brep: bool = True,
     ) -> None:
         self.data_root = Path(data_root)
         self.mesh_dir = self._resolve_template_path(mesh_dir_template, split)
@@ -83,6 +84,7 @@ class BRepMeshDataset(Dataset):
         self.op_cache_dir = None if op_cache_dir is None else str(Path(op_cache_dir))
         self.input_features = input_features
         self.load_mesh = load_mesh
+        self.load_brep = load_brep
 
         if input_features not in ("xyz", "hks"):
             raise ValueError("input_features must be one of: xyz, hks")
@@ -116,9 +118,11 @@ class BRepMeshDataset(Dataset):
     def _filter_existing(self, names: list[str]) -> list[str]:
         out = []
         for name in names:
-            required = [self.graph_dir / f"{name}.bin"]
-            if self.brep_seg_dir is not None:
-                required.append(self.brep_seg_dir / f"{name}.seg")
+            required = []
+            if self.load_brep:
+                required.append(self.graph_dir / f"{name}.bin")
+                if self.brep_seg_dir is not None:
+                    required.append(self.brep_seg_dir / f"{name}.seg")
             if self.load_mesh:
                 required.extend(
                     [
@@ -154,7 +158,7 @@ class BRepMeshDataset(Dataset):
         graph.ndata["y"] = labels
         return _to_float32_graph(graph), labels
 
-    def _load_mesh(self, name: str, brep_labels: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _load_mesh(self, name: str, brep_labels: torch.Tensor | None) -> dict[str, torch.Tensor]:
         verts_np, faces_np = _read_obj_tri_mesh(self.mesh_dir / f"{name}.obj")
         fidx_np = np.loadtxt(self.mesh_dir / f"{name}.fidx", dtype=np.int64, ndmin=1)
         if faces_np.shape[0] != fidx_np.shape[0]:
@@ -164,15 +168,21 @@ class BRepMeshDataset(Dataset):
         faces = torch.tensor(np.ascontiguousarray(faces_np)).long()
         fidx = torch.tensor(np.ascontiguousarray(fidx_np)).long()
 
-        if int(fidx.max()) >= brep_labels.shape[0] or int(fidx.min()) < 0:
-            raise ValueError(f"{name}: fidx range is outside B-rep face count {brep_labels.shape[0]}")
+        if brep_labels is not None:
+            if int(fidx.max()) >= brep_labels.shape[0] or int(fidx.min()) < 0:
+                raise ValueError(f"{name}: fidx range is outside B-rep face count {brep_labels.shape[0]}")
 
         mesh_seg_path = self.mesh_dir / f"{name}.seg"
         if mesh_seg_path.exists():
             mesh_labels_np = np.loadtxt(mesh_seg_path, dtype=np.int64, ndmin=1)
             mesh_labels = torch.tensor(np.ascontiguousarray(mesh_labels_np)).long()
-        else:
+        elif brep_labels is not None:
             mesh_labels = brep_labels[fidx]
+        else:
+            raise FileNotFoundError(
+                f"{name}: no mesh .seg file found and B-rep labels not loaded (--no_teacher). "
+                "Provide a per-mesh .seg file alongside the .obj."
+            )
 
         if mesh_labels.shape[0] != faces.shape[0]:
             raise ValueError(f"{name}: mesh labels do not match triangle face count")
@@ -205,12 +215,12 @@ class BRepMeshDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         name = self.names[idx]
-        graph, brep_labels = self._load_brep(name)
-        sample: dict[str, Any] = {
-            "name": name,
-            "brep_graph": graph,
-            "brep_labels": brep_labels,
-        }
+        sample: dict[str, Any] = {"name": name}
+        brep_labels: torch.Tensor | None = None
+        if self.load_brep:
+            graph, brep_labels = self._load_brep(name)
+            sample["brep_graph"] = graph
+            sample["brep_labels"] = brep_labels
         if not self.load_mesh:
             return sample
         sample.update(self._load_mesh(name, brep_labels))

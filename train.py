@@ -22,12 +22,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .data import BRepMeshDataset, collate_brep_samples, collate_distill_samples
-from .losses import feature_alignment_loss, relational_distillation_loss, scatter_mean_by_index
+from .losses import FCRDLoss, relational_distillation_loss, scatter_mean_by_index
 from .models import (
     DiffusionMeshStudent,
     FOVNetFaceTeacher,
     classification_stats,
     freeze_module,
+    fovnet_teacher_from_checkpoint,
     load_fovnet_teacher_checkpoint,
     mean_iou,
 )
@@ -41,6 +42,13 @@ try:
     _HAS_PD_MESHNET = True
 except Exception:  # pragma: no cover
     _HAS_PD_MESHNET = False
+
+# PoissonNet student (optional — pure-PyTorch, no extra CUDA deps)
+try:
+    from .PoissonNet import PoissonMeshStudent
+    _HAS_POISSON = True
+except Exception:  # pragma: no cover
+    _HAS_POISSON = False
 
 # PyG Data detection for device-movement
 try:
@@ -90,9 +98,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--student_type",
-        choices=["diffusion_net", "pd_meshnet"],
+        choices=["diffusion_net", "pd_meshnet", "poisson_net"],
         default="diffusion_net",
-        help="Student backbone: diffusion_net (default) or pd_meshnet.",
+        help="Student backbone: diffusion_net (default), pd_meshnet, or poisson_net.",
     )
     parser.add_argument(
         "--no_teacher",
@@ -120,7 +128,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Explicit FOVNet teacher checkpoint file. If omitted, the teacher is trained first.",
     )
-    parser.add_argument("--teacher_epochs", type=int, default=50)
+    parser.add_argument("--teacher_epochs", type=int, default=100)
     parser.add_argument("--teacher_lr", type=float, default=5e-3)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -144,9 +152,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_op_cache", action="store_true")
     parser.add_argument("--num_classes", type=int, default=None)
+    
     # DiffusionNet student args
     parser.add_argument("--student_width", type=int, default=128)
     parser.add_argument("--student_blocks", type=int, default=4)
+    
     # PD-MeshNet student args
     parser.add_argument(
         "--pd_conv_channels",
@@ -160,6 +170,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory to cache PD-MeshNet primal/dual graphs. Defaults to dataset pd_cache dir.",
     )
+    
+    # PoissonNet student args
+    parser.add_argument(
+        "--poisson_cache_dir",
+        default=None,
+        help="Directory to cache PoissonNet per-mesh operators (G_coeffs, M). "
+             "If omitted, caches under <output_dir>/poisson_cache for this run.",
+    )
+    
+    # Overall
     parser.add_argument("--embedding_dim", type=int, default=128)
     parser.add_argument(
         "--lr_scheduler",
@@ -172,18 +192,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_gamma", type=float, default=0.5, help="StepLR: multiplicative decay factor.")
     parser.add_argument("--rkd_mode", choices=["distance", "angle", "distance_angle"], default="distance_angle")
     parser.add_argument("--distill_weight", type=float, default=1.0)
-    parser.add_argument("--align_weight", type=float, default=0)
+    parser.add_argument("--fcrd_weight", type=float, default=1.0)
+    parser.add_argument("--fcrd_tau", type=float, default=0.07)
+    parser.add_argument("--fcrd_dim", type=int, default=128)
     parser.add_argument("--mesh_loss_weight", type=float, default=1.0)
+    
     parser.add_argument("--limit_train", type=int, default=None)
     parser.add_argument("--limit_val", type=int, default=None)
     parser.add_argument("--limit_test", type=int, default=None)
+    
     parser.add_argument("--skip_test", action="store_true")
+    
+    # if you need to run test only
     parser.add_argument("--test_only", action="store_true",
                         help="Skip training and run test phase only. Requires --student_ckpt.")
     parser.add_argument("--student_ckpt", default=None,
                         help="Path to a student checkpoint (.pt) to load before test.")
+    
+    
     parser.add_argument("--visualize_test_count", type=int, default=30)
     parser.add_argument("--visualize_dir", default=None)
+    
+    # teacher args
     parser.add_argument("--no_vision", action="store_true")
     parser.add_argument("--no_ov", action="store_true")
     parser.add_argument("--no_iv", action="store_true")
@@ -355,6 +385,7 @@ def make_loaders(args: argparse.Namespace, load_mesh: bool = True):
         op_cache_dir=args.op_cache_dir,
         input_features=args.input_features,
         load_mesh=load_mesh,
+        load_brep=not args.no_teacher,
     )
     train_set = BRepMeshDataset(split="train", limit=args.limit_train, **common)
     val_set = BRepMeshDataset(split="val", limit=args.limit_val, **common)
@@ -415,20 +446,37 @@ def make_models(
     args: argparse.Namespace,
     teacher_device: torch.device,
     student_device: torch.device,
+    output_dir: Path | None = None,
 ):
-    teacher = FOVNetFaceTeacher(
-        num_classes=args.num_classes,
-        vision=not args.no_vision,
-        vision_az=args.vision_az,
-        vision_el=args.vision_el,
-        local_uv=not args.global_uv,
-        segmentation=True,
-        use_face_feat=not args.no_face_feat,
-        use_uv=not args.no_uv,
-        use_ov=not args.no_ov,
-        use_iv=not args.no_iv,
-        graph_emb_dim=args.embedding_dim,
-    )
+    if not args.no_teacher and args.teacher_ckpt:
+        teacher, hparams = fovnet_teacher_from_checkpoint(
+            args.teacher_ckpt,
+            emb_dim=args.embedding_dim,  # fallback for ckpts predating --emb_dim
+        )
+        ckpt_num_classes = hparams.get("num_classes")
+        if ckpt_num_classes is not None and ckpt_num_classes != args.num_classes:
+            raise ValueError(
+                f"Checkpoint num_classes={ckpt_num_classes} does not match "
+                f"--num_classes={args.num_classes}. Use the correct checkpoint for this dataset."
+            )
+        print(f"Loaded teacher architecture from checkpoint: {args.teacher_ckpt}")
+        print(f"  hparams: { {k: v for k, v in hparams.items() if k != 'lr'} }")
+    else:
+        teacher = FOVNetFaceTeacher(
+            num_classes=args.num_classes,
+            vision=not args.no_vision,
+            vision_az=args.vision_az,
+            vision_el=args.vision_el,
+            local_uv=not args.global_uv,
+            segmentation=True,
+            use_face_feat=not args.no_face_feat,
+            use_uv=not args.no_uv,
+            use_ov=not args.no_ov,
+            use_iv=not args.no_iv,
+            srf_emb_dim=args.embedding_dim,
+            vision_emb_dim=args.embedding_dim,
+            graph_emb_dim=args.embedding_dim,
+        )
 
     if args.student_type == "pd_meshnet":
         if not _HAS_PD_MESHNET:
@@ -440,6 +488,16 @@ def make_models(
             embedding_dim=args.embedding_dim,
             conv_primal_out_res=args.pd_conv_channels,
             conv_dual_out_res=args.pd_conv_channels,
+        )
+    elif args.student_type == "poisson_net":
+        if not _HAS_POISSON:
+            raise ImportError("PoissonNet dependencies not available. Check B2Mesh/PoissonNet/.")
+        student = PoissonMeshStudent(
+            embedding_dim=args.embedding_dim,
+            num_classes=args.num_classes,
+            width=args.student_width,
+            blocks=args.student_blocks,
+            solver_cache_dir=args.poisson_cache_dir or (output_dir / "poisson_cache" if output_dir is not None else None),
         )
     else:
         student = DiffusionMeshStudent(
@@ -457,8 +515,15 @@ def make_models(
     return teacher.to(teacher_device), student.to(student_device)
 
 
-def make_optimizer(args: argparse.Namespace, student: torch.nn.Module):
-    return torch.optim.AdamW(student.parameters(), lr=args.lr)
+def make_optimizer(
+    args: argparse.Namespace,
+    student: torch.nn.Module,
+    fcrd_loss: FCRDLoss | None = None,
+) -> torch.optim.Optimizer:
+    params = list(student.parameters())
+    if fcrd_loss is not None:
+        params += list(fcrd_loss.parameters())
+    return torch.optim.AdamW(params, lr=args.lr)
 
 
 def make_teacher_optimizer(args: argparse.Namespace, teacher: torch.nn.Module):
@@ -504,6 +569,7 @@ def forward_losses(
     student: torch.nn.Module,
     sample: dict[str, Any],
     args: argparse.Namespace,
+    fcrd_loss: FCRDLoss | None = None,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor, torch.Tensor]:
     mesh_labels = sample["mesh_labels"]
 
@@ -524,7 +590,7 @@ def forward_losses(
         teacher is not None
         and "brep_graph" in sample
         and sample["brep_graph"] is not None
-        and (args.distill_weight > 0 or args.align_weight > 0)
+        and args.distill_weight > 0
     )
     if has_brep:
         with torch.no_grad():
@@ -536,22 +602,27 @@ def forward_losses(
             output_size=teacher_face_emb.shape[0],
         )
         rel = relational_distillation_loss(teacher_face_emb, student_brep_emb, face_mask, mode=args.rkd_mode)
-        align = feature_alignment_loss(teacher_face_emb, student_brep_emb, face_mask)
+
+        if fcrd_loss is not None and args.fcrd_weight > 0:
+            brep_labels = sample["brep_labels"].to(student_tri_emb.device)
+            fcrd = fcrd_loss(teacher_face_emb, student_brep_emb, brep_labels, face_mask)
+        else:
+            fcrd = student_tri_emb.new_zeros(())
     else:
-        rel = torch.tensor(0.0, device=student_tri_emb.device)
-        align = torch.tensor(0.0, device=student_tri_emb.device)
+        rel  = student_tri_emb.new_zeros(())
+        fcrd = student_tri_emb.new_zeros(())
 
     loss = (
         args.mesh_loss_weight * mesh_ce
-        + args.distill_weight * rel
-        + args.align_weight * align
+        + args.distill_weight  * rel
+        + args.fcrd_weight     * fcrd
     )
 
     parts = {
-        "loss": float(loss.detach().cpu()),
+        "loss":    float(loss.detach().cpu()),
         "mesh_ce": float(mesh_ce.detach().cpu()),
-        "rel": float(rel.detach().cpu()),
-        "align": float(align.detach().cpu()),
+        "rel":     float(rel.detach().cpu()),
+        "fcrd":    float(fcrd.detach().cpu()),
     }
     return loss, parts, student_logits, mesh_labels
 
@@ -617,13 +688,16 @@ def run_epoch(
     student_device: torch.device,
     args: argparse.Namespace,
     desc: str,
+    fcrd_loss: FCRDLoss | None = None,
 ) -> dict[str, float]:
     train = optimizer is not None
     if teacher is not None:
         teacher.eval()
     student.train(train)
+    if fcrd_loss is not None:
+        fcrd_loss.train(train)
 
-    totals = {"loss": 0.0, "mesh_ce": 0.0, "rel": 0.0, "align": 0.0}
+    totals = {"loss": 0.0, "mesh_ce": 0.0, "rel": 0.0, "fcrd": 0.0}
     confusion = torch.zeros((args.num_classes, args.num_classes), dtype=torch.long)
     correct = 0
     total = 0
@@ -638,7 +712,7 @@ def run_epoch(
 
             batch_loss = 0.0
             for sample in samples:
-                loss, parts, logits, labels = forward_losses(teacher, student, sample, args)
+                loss, parts, logits, labels = forward_losses(teacher, student, sample, args, fcrd_loss=fcrd_loss)
                 batch_loss = batch_loss + loss / len(samples)
                 c, t, conf = classification_stats(logits, labels, num_classes=args.num_classes)
                 correct += c
@@ -693,6 +767,7 @@ def save_checkpoint(
     args: argparse.Namespace,
     metrics: dict[str, float],
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    fcrd_loss: FCRDLoss | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
@@ -706,6 +781,8 @@ def save_checkpoint(
         ckpt["teacher"] = teacher.state_dict()
     if scheduler is not None:
         ckpt["scheduler"] = scheduler.state_dict()
+    if fcrd_loss is not None:
+        ckpt["fcrd_loss"] = fcrd_loss.state_dict()
     torch.save(ckpt, path)
 
 
@@ -715,6 +792,7 @@ def load_checkpoint(
     student: torch.nn.Module,
     teacher_device: torch.device,
     student_device: torch.device,
+    fcrd_loss: FCRDLoss | None = None,
 ) -> dict[str, Any]:
     ckpt = torch.load(path, map_location="cpu")
     if teacher is not None and "teacher" in ckpt:
@@ -722,6 +800,9 @@ def load_checkpoint(
         teacher.to(teacher_device)
     student.load_state_dict(ckpt["student"])
     student.to(student_device)
+    if fcrd_loss is not None and "fcrd_loss" in ckpt:
+        fcrd_loss.load_state_dict(ckpt["fcrd_loss"])
+        fcrd_loss.to(student_device)
     return ckpt
 
 
@@ -741,7 +822,7 @@ def _metrics_row(
     row: dict[str, float | int] = {
         "epoch": epoch,
         "lr": lr,
-        "best_val_loss": best_val,
+        "best_val_miou": best_val,
     }
     row.update({f"train_{key}": value for key, value in train_metrics.items()})
     row.update({f"val_{key}": value for key, value in val_metrics.items()})
@@ -919,7 +1000,7 @@ def main() -> None:
     set_current_cuda_device(student_device)
 
     teacher_tag = "None" if args.no_teacher else "FOVNet"
-    student_tag = {"diffusion_net": "DiffusionNet", "pd_meshnet": "PDNet"}[args.student_type]
+    student_tag = {"diffusion_net": "DiffusionNet", "pd_meshnet": "PDNet", "poisson_net": "PoissonNet"}[args.student_type]
     dataset_tag = args.dataset.replace("++", "pp")  # mfcad++ → mfcadpp (filesystem-safe)
     input_tag = args.input_features
     run_name = f"{teacher_tag}_{student_tag}_{dataset_tag}_{input_tag}_{time.strftime('%m%d_%H%M%S')}"
@@ -929,23 +1010,29 @@ def main() -> None:
         json.dump(vars(args), f, indent=2)
     print(f"Student type: {args.student_type}  |  teacher: {'disabled' if args.no_teacher else 'enabled'}")
     print(f"Segmentation loss: {args.seg_loss}")
-    if args.student_type == "diffusion_net":
-        print(f"Using DiffusionNet op cache: {args.op_cache_dir}")
-    else:
+    if args.student_type == "pd_meshnet":
         print(f"Using PD-MeshNet graph cache: {args.pd_cache_dir}")
+    else:
+        print(f"Using DiffusionNet op cache: {args.op_cache_dir}")
     if not args.no_teacher:
         print(f"Using teacher device: {teacher_device}; student device: {student_device}")
 
     train_loader, val_loader, test_loader = make_loaders(args, load_mesh=True)
-    teacher, student = make_models(args, teacher_device, student_device)
+    teacher, student = make_models(args, teacher_device, student_device, output_dir)
+
+    fcrd_loss: FCRDLoss | None = None
+    if not args.no_teacher and args.fcrd_weight > 0:
+        fcrd_loss = FCRDLoss(
+            embedding_dim=args.embedding_dim,
+            proj_dim=args.fcrd_dim,
+            tau=args.fcrd_tau,
+        ).to(student_device)
 
     if args.no_teacher:
         print("--no_teacher: skipping teacher setup, distillation disabled.")
     elif args.teacher_ckpt:
-        if not Path(args.teacher_ckpt).is_file():
-            raise FileNotFoundError(f"--teacher_ckpt must be a checkpoint file: {args.teacher_ckpt}")
-        print(f"Loading FOVNet teacher checkpoint: {args.teacher_ckpt}")
-        load_fovnet_teacher_checkpoint(teacher, args.teacher_ckpt)
+        # Teacher already created and weights loaded inside make_models.
+        pass
     else:
         print("No --teacher_ckpt provided; training FOVNet teacher first.")
         teacher_train_loader, teacher_val_loader = make_teacher_loaders(args)
@@ -1002,11 +1089,11 @@ def main() -> None:
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"--student_ckpt not found: {ckpt_path}")
         print(f"[test_only] Loading student checkpoint: {ckpt_path}")
-        load_checkpoint(ckpt_path, teacher if not args.no_teacher else None, student, teacher_device, student_device)
+        load_checkpoint(ckpt_path, teacher if not args.no_teacher else None, student, teacher_device, student_device, fcrd_loss=fcrd_loss)
         if teacher is not None:
             freeze_module(teacher)
         t0 = time.perf_counter()
-        test_metrics = run_epoch(teacher, student, test_loader, None, teacher_device, student_device, args, "test")
+        test_metrics = run_epoch(teacher, student, test_loader, None, teacher_device, student_device, args, "test", fcrd_loss=fcrd_loss)
         test_time_s = time.perf_counter() - t0
         test_metrics["test_time_s"] = round(test_time_s, 3)
         n_test = len(test_loader.dataset)
@@ -1031,25 +1118,25 @@ def main() -> None:
 
     if teacher is not None:
         freeze_module(teacher)
-    optimizer = make_optimizer(args, student)
+    optimizer = make_optimizer(args, student, fcrd_loss=fcrd_loss)
     scheduler = make_scheduler(args, optimizer, args.epochs)
 
-    best_val = float("inf")
+    best_val = float("-inf")
     epoch_train_times: list[float] = []
     epoch_val_times: list[float] = []
     for epoch in range(1, args.epochs + 1):
         epoch_lr = current_lr(optimizer)
         t0 = time.perf_counter()
-        train_metrics = run_epoch(teacher, student, train_loader, optimizer, teacher_device, student_device, args, "train")
+        train_metrics = run_epoch(teacher, student, train_loader, optimizer, teacher_device, student_device, args, "train", fcrd_loss=fcrd_loss)
         train_time_s = time.perf_counter() - t0
         t0 = time.perf_counter()
-        val_metrics = run_epoch(teacher, student, val_loader, None, teacher_device, student_device, args, "val")
+        val_metrics = run_epoch(teacher, student, val_loader, None, teacher_device, student_device, args, "val", fcrd_loss=fcrd_loss)
         val_time_s = time.perf_counter() - t0
         epoch_train_times.append(train_time_s)
         epoch_val_times.append(val_time_s)
-        is_best = val_metrics["loss"] < best_val
+        is_best = val_metrics["mesh_miou"] > best_val
         if is_best:
-            best_val = val_metrics["loss"]
+            best_val = val_metrics["mesh_miou"]
         if scheduler is not None:
             scheduler.step()
         print_metrics(epoch, train_metrics, val_metrics, train_time_s, val_time_s)
@@ -1058,17 +1145,17 @@ def main() -> None:
             _metrics_row(epoch, train_metrics, val_metrics, epoch_lr, best_val, train_time_s, val_time_s),
         )
 
-        save_checkpoint(output_dir / "last.pt", teacher, student, optimizer, epoch, args, val_metrics, scheduler)
+        save_checkpoint(output_dir / "last.pt", teacher, student, optimizer, epoch, args, val_metrics, scheduler, fcrd_loss=fcrd_loss)
         if is_best:
-            save_checkpoint(output_dir / "best.pt", teacher, student, optimizer, epoch, args, val_metrics, scheduler)
+            save_checkpoint(output_dir / "best.pt", teacher, student, optimizer, epoch, args, val_metrics, scheduler, fcrd_loss=fcrd_loss)
 
     test_time_s: float | None = None
     if not args.skip_test:
         best_path = output_dir / "best.pt"
         if best_path.exists():
-            load_checkpoint(best_path, teacher, student, teacher_device, student_device)
+            load_checkpoint(best_path, teacher, student, teacher_device, student_device, fcrd_loss=fcrd_loss)
         t0 = time.perf_counter()
-        test_metrics = run_epoch(teacher, student, test_loader, None, teacher_device, student_device, args, "test")
+        test_metrics = run_epoch(teacher, student, test_loader, None, teacher_device, student_device, args, "test", fcrd_loss=fcrd_loss)
         test_time_s = time.perf_counter() - t0
         test_metrics["test_time_s"] = round(test_time_s, 3)
         n_test = len(test_loader.dataset)

@@ -119,22 +119,59 @@ class DiffusionMeshStudent(nn.Module):
         return logits, face_embeddings
 
 
-def load_fovnet_teacher_checkpoint(model: FOVNetFaceTeacher, ckpt_path: str | Path, strict: bool = False) -> None:
-    """Load either a Lightning FOVNetModule checkpoint or a plain state dict."""
+_TEACHER_TRAIN_ONLY_HPARAMS = {"lr", "train_random_rotation"}
 
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
-    state = ckpt.get("state_dict", ckpt)
+
+def _clean_state_dict(state: dict) -> OrderedDict:
     cleaned = OrderedDict()
     for key, value in state.items():
         if key.startswith("model."):
-            cleaned[key[len("model.") :]] = value
+            cleaned[key[len("model."):]] = value
         elif key.startswith("teacher.model."):
-            cleaned[key[len("teacher.model.") :]] = value
+            cleaned[key[len("teacher.model."):]] = value
         elif key.startswith("teacher."):
-            cleaned[key[len("teacher.") :]] = value
+            cleaned[key[len("teacher."):]] = value
         else:
             cleaned[key] = value
-    model.model.load_state_dict(cleaned, strict=strict)
+    return cleaned
+
+
+def fovnet_teacher_from_checkpoint(
+    ckpt_path: str | Path,
+    emb_dim: int = 128,
+) -> tuple["FOVNetFaceTeacher", dict]:
+    """Create FOVNetFaceTeacher from a Lightning checkpoint.
+
+    Architecture hyperparameters (vision, az, el, uv, num_classes,
+    srf_emb_dim, vision_emb_dim, graph_emb_dim …) are read directly from the
+    checkpoint's hyper_parameters.  emb_dim is used as a fallback for all three
+    embedding dims only when the checkpoint predates the --emb_dim flag.
+
+    Returns (teacher, hparams) where hparams is the full dict from the ckpt.
+    """
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    hparams = ckpt.get("hyper_parameters", {})
+
+    model_kw = {k: v for k, v in hparams.items() if k not in _TEACHER_TRAIN_ONLY_HPARAMS}
+    model_kw.setdefault("srf_emb_dim", emb_dim)
+    model_kw.setdefault("vision_emb_dim", emb_dim)
+    model_kw.setdefault("graph_emb_dim", emb_dim)
+    model_kw.setdefault("segmentation", True)
+
+    teacher = FOVNetFaceTeacher(**model_kw)
+    teacher.model.load_state_dict(_clean_state_dict(ckpt.get("state_dict", ckpt)), strict=True)
+    return teacher, hparams
+
+
+def load_fovnet_teacher_checkpoint(model: FOVNetFaceTeacher, ckpt_path: str | Path, strict: bool = False) -> None:
+    """Load weights only into an already-constructed FOVNetFaceTeacher.
+
+    Prefer fovnet_teacher_from_checkpoint() when possible — it reads
+    architecture hyperparameters from the checkpoint instead of relying on
+    the caller to match them manually.
+    """
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    model.model.load_state_dict(_clean_state_dict(ckpt.get("state_dict", ckpt)), strict=strict)
 
 
 def freeze_module(module: nn.Module) -> None:
